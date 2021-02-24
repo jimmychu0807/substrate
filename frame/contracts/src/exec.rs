@@ -18,14 +18,14 @@
 use crate::{
 	CodeHash, Event, Config, Module as Contracts,
 	TrieId, BalanceOf, ContractInfo, gas::GasMeter, rent::Rent, storage::{self, Storage},
-	Error, ContractInfoOf, Schedule,
+	Error, ContractInfoOf, Schedule, AliveContractInfo,
 };
 use sp_core::crypto::UncheckedFrom;
 use sp_std::{
 	prelude::*,
 	marker::PhantomData,
 };
-use sp_runtime::traits::{Bounded, Zero, Convert, Saturating};
+use sp_runtime::{Perbill, traits::{Bounded, Zero, Convert, Saturating}};
 use frame_support::{
 	dispatch::{DispatchResult, DispatchError},
 	traits::{ExistenceRequirement, Currency, Time, Randomness, Get},
@@ -43,13 +43,48 @@ pub type StorageKey = [u8; 32];
 /// A type that represents a topic of an event. At the moment a hash is used.
 pub type TopicOf<T> = <T as frame_system::Config>::Hash;
 
-/// Describes whether we deal with a contract or a plain account.
-pub enum TransactorKind {
-	/// Transaction was initiated from a plain account. That can be either be through a
-	/// signed transaction or through RPC.
-	PlainAccount,
-	/// The call was initiated by a contract account.
-	Contract,
+/// Information needed for rent calculations that can be requested by a contract.
+#[derive(codec::Encode)]
+pub struct RentInfo<T: Config> {
+	/// See crate [`Contracts::subsistence_threshold()`].
+	subsistence_threshold: BalanceOf<T>,
+	/// See crate [`Config::DepositPerContract`].
+	deposit_per_contract: BalanceOf<T>,
+	/// See crate [`Config::DepositPerStorageByte`].
+	deposit_per_storage_byte: BalanceOf<T>,
+	/// See crate [`Config::DepositPerStorageItem`].
+	deposit_per_storage_item: BalanceOf<T>,
+	/// See crate [`Ext::rent_allowance()`].
+	rent_allowance: BalanceOf<T>,
+	/// See crate [`Config::RentFraction`].
+	rent_fraction: Perbill,
+	/// See crate [`AliveContractInfo::storage_size`].
+	storage_size: u32,
+	/// See crate [`Executable::code_len()`].
+	code_size: u32,
+	/// See crate [`Executable::refcount()`].
+	code_refcount: u32,
+	/// Reserved for backwards compatible changes to this data structure.
+	_reserved: Option<()>,
+}
+
+/// We cannot derive `Default` because `T` does not necessarily implement `Default`.
+#[cfg(test)]
+impl<T: Config> Default for RentInfo<T> {
+	fn default() -> Self {
+		Self {
+			subsistence_threshold: Default::default(),
+			deposit_per_contract: Default::default(),
+			deposit_per_storage_byte: Default::default(),
+			deposit_per_storage_item: Default::default(),
+			rent_allowance: Default::default(),
+			rent_fraction: Default::default(),
+			storage_size: Default::default(),
+			code_size: Default::default(),
+			code_refcount: Default::default(),
+			_reserved: Default::default(),
+		}
+	}
 }
 
 /// An interface that provides access to the external environment in which the
@@ -198,6 +233,9 @@ pub trait Ext: sealing::Sealed {
 
 	/// Get a reference to the schedule used by the current call.
 	fn schedule(&self) -> &Schedule<Self::T>;
+
+	/// Information needed for rent calculations.
+	fn rent_info(&self) -> &RentInfo<Self::T>;
 }
 
 /// Describes the different functions that can be exported by an [`Executable`].
@@ -273,16 +311,22 @@ pub trait Executable<T: Config>: Sized {
 
 	/// Size of the instrumented code in bytes.
 	fn code_len(&self) -> u32;
+
+	/// Size of the original code in bytes.
+	fn origignal_code_len(&self) -> u32;
+
+	// The number of contracts using this executable.
+	fn refcount(&self) -> u32;
 }
 
 pub struct ExecutionContext<'a, T: Config + 'a, E> {
-	pub caller: Option<&'a ExecutionContext<'a, T, E>>,
-	pub self_account: T::AccountId,
-	pub self_trie_id: Option<TrieId>,
-	pub depth: usize,
-	pub schedule: &'a Schedule<T>,
-	pub timestamp: MomentOf<T>,
-	pub block_number: T::BlockNumber,
+	caller: Option<&'a ExecutionContext<'a, T, E>>,
+	self_account: T::AccountId,
+	self_trie_id: Option<TrieId>,
+	depth: usize,
+	schedule: &'a Schedule<T>,
+	timestamp: MomentOf<T>,
+	block_number: T::BlockNumber,
 	_phantom: PhantomData<E>,
 }
 
@@ -371,8 +415,10 @@ where
 				)?
 			}
 
+			let call_context = nested.new_call_context(caller, value, &contract, &executable);
+
 			let output = executable.execute(
-				nested.new_call_context(caller, value),
+				call_context,
 				&ExportedFunction::Call,
 				input_data,
 				gas_meter,
@@ -403,7 +449,7 @@ where
 			let dest_trie_id = Storage::<T>::generate_trie_id(&dest);
 
 			let output = self.with_nested_context(dest.clone(), dest_trie_id, |nested| {
-				Storage::<T>::place_contract(
+				let contract = Storage::<T>::place_contract(
 					&dest,
 					nested
 						.self_trie_id
@@ -428,8 +474,15 @@ where
 				// spawned. This is OK as overcharging is always safe.
 				let occupied_storage = executable.occupied_storage();
 
+				let call_context = nested.new_call_context(
+					caller.clone(),
+					endowment,
+					&contract,
+					&executable,
+				);
+
 				let output = executable.execute(
-					nested.new_call_context(caller.clone(), endowment),
+					call_context,
 					&ExportedFunction::Constructor,
 					input_data,
 					gas_meter,
@@ -469,15 +522,30 @@ where
 		&'b mut self,
 		caller: T::AccountId,
 		value: BalanceOf<T>,
+		contract: &AliveContractInfo<T>,
+		executable: &E,
 	) -> CallContext<'b, 'a, T, E> {
 		let timestamp = self.timestamp.clone();
 		let block_number = self.block_number.clone();
+		let rent_info = RentInfo {
+			subsistence_threshold: <Contracts<T>>::subsistence_threshold(),
+			deposit_per_contract: T::DepositPerContract::get(),
+			deposit_per_storage_byte: T::DepositPerStorageByte::get(),
+			deposit_per_storage_item: T::DepositPerStorageItem::get(),
+			rent_allowance: contract.rent_allowance,
+			rent_fraction: T::RentFraction::get(),
+			storage_size: contract.storage_size,
+			code_size: executable.code_len().saturating_add(executable.origignal_code_len()),
+			code_refcount: executable.refcount(),
+			_reserved: None,
+		};
 		CallContext {
 			ctx: self,
 			caller,
 			value_transferred: value,
 			timestamp,
 			block_number,
+			rent_info,
 			_phantom: Default::default(),
 		}
 	}
@@ -515,6 +583,15 @@ where
 			TransactorKind::Contract
 		}
 	}
+}
+
+/// Describes whether we deal with a contract or a plain account.
+enum TransactorKind {
+	/// Transaction was initiated from a plain account. That can be either be through a
+	/// signed transaction or through RPC.
+	PlainAccount,
+	/// The call was initiated by a contract account.
+	Contract,
 }
 
 /// Describes possible transfer causes.
@@ -581,6 +658,7 @@ struct CallContext<'a, 'b: 'a, T: Config + 'b, E> {
 	value_transferred: BalanceOf<T>,
 	timestamp: MomentOf<T>,
 	block_number: T::BlockNumber,
+	rent_info: RentInfo<T>,
 	_phantom: PhantomData<E>,
 }
 
@@ -791,6 +869,10 @@ where
 	fn schedule(&self) -> &Schedule<Self::T> {
 		&self.ctx.schedule
 	}
+
+	fn rent_info(&self) -> &RentInfo<Self::T> {
+		&self.rent_info
+	}
 }
 
 fn deposit_event<T: Config>(
@@ -935,6 +1017,14 @@ mod tests {
 
 		fn code_len(&self) -> u32 {
 			0
+		}
+
+		fn origignal_code_len(&self) -> u32 {
+			0
+		}
+
+		fn refcount(&self) -> u32 {
+			1
 		}
 	}
 

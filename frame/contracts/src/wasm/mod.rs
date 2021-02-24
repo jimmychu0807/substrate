@@ -231,6 +231,14 @@ where
 	fn code_len(&self) -> u32 {
 		self.code.len() as u32
 	}
+
+	fn origignal_code_len(&self) -> u32 {
+		self.original_code_len
+	}
+
+	fn refcount(&self) -> u32 {
+		self.refcount as u32
+	}
 }
 
 #[cfg(test)]
@@ -238,7 +246,7 @@ mod tests {
 	use super::*;
 	use crate::{
 		CodeHash, BalanceOf, Error, Module as Contracts,
-		exec::{Ext, StorageKey, AccountIdOf, Executable},
+		exec::{Ext, StorageKey, AccountIdOf, Executable, RentInfo},
 		gas::GasMeter,
 		tests::{Test, Call, ALICE, BOB},
 	};
@@ -295,6 +303,7 @@ mod tests {
 		// (topics, data)
 		events: Vec<(Vec<H256>, Vec<u8>)>,
 		schedule: Schedule<Test>,
+		rent_info: RentInfo<Test>,
 	}
 
 	impl Ext for MockExt {
@@ -395,45 +404,37 @@ mod tests {
 		fn value_transferred(&self) -> u64 {
 			1337
 		}
-
 		fn now(&self) -> &u64 {
 			&1111
 		}
-
 		fn minimum_balance(&self) -> u64 {
 			666
 		}
-
 		fn tombstone_deposit(&self) -> u64 {
 			16
 		}
-
 		fn random(&self, subject: &[u8]) -> H256 {
 			H256::from_slice(subject)
 		}
-
 		fn deposit_event(&mut self, topics: Vec<H256>, data: Vec<u8>) {
 			self.events.push((topics, data))
 		}
-
 		fn set_rent_allowance(&mut self, rent_allowance: u64) {
 			self.rent_allowance = rent_allowance;
 		}
-
 		fn rent_allowance(&self) -> u64 {
 			self.rent_allowance
 		}
-
 		fn block_number(&self) -> u64 { 121 }
-
 		fn max_value_size(&self) -> u32 { 16_384 }
-
 		fn get_weight_price(&self, weight: Weight) -> BalanceOf<Self::T> {
 			BalanceOf::<Self::T>::from(1312_u32).saturating_mul(weight.into())
 		}
-
 		fn schedule(&self) -> &Schedule<Self::T> {
 			&self.schedule
+		}
+		fn rent_info(&self) -> &RentInfo<Self::T> {
+			&self.rent_info
 		}
 	}
 
@@ -536,6 +537,9 @@ mod tests {
 		}
 		fn schedule(&self) -> &Schedule<Self::T> {
 			(**self).schedule()
+		}
+		fn rent_info(&self) -> &RentInfo<Self::T> {
+			(**self).rent_info()
 		}
 	}
 
