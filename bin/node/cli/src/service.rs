@@ -28,13 +28,17 @@ use sc_service::{
 	config::{Configuration}, error::{Error as ServiceError},
 	RpcHandlers, TaskManager,
 };
+use sp_core::{Pair};
 use sp_inherents::InherentDataProviders;
 use sc_network::{Event, NetworkService};
 use sp_runtime::traits::Block as BlockT;
+use sp_keystore::{SyncCryptoStore};
 use futures::prelude::*;
 use sc_client_api::{ExecutorProvider, RemoteBackend};
 use node_executor::Executor;
 use sc_telemetry::TelemetryConnectionNotifier;
+
+use pallet_example_offchain_worker as example_ocw;
 
 type FullClient = sc_service::TFullClient<Block, RuntimeApi, Executor>;
 type FullBackend = sc_service::TFullBackend<Block>;
@@ -63,6 +67,18 @@ pub fn new_partial(config: &Configuration) -> Result<sc_service::PartialComponen
 	let (client, backend, keystore_container, task_manager) =
 		sc_service::new_full_parts::<Block, RuntimeApi, Executor>(&config)?;
 	let client = Arc::new(client);
+
+	// JC-NOTE: For inserting key be used in ocw
+	let secret_uri = "//Alice";
+	let key_pair = example_ocw::crypto::Pair::from_string(secret_uri, None)
+		.expect("Generates key pair");
+	let keystore = keystore_container.sync_keystore();
+	SyncCryptoStore::insert_unknown(
+		&*keystore,
+		example_ocw::KEY_TYPE,
+		secret_uri,
+		key_pair.public().as_ref()
+	).expect("Insert key should succeed");
 
 	let select_chain = sc_consensus::LongestChain::new(backend.clone());
 
